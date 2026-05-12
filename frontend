@@ -1,0 +1,257 @@
+pipeline {
+    agent any
+
+    environment {
+        PROJECT_NAME       = 'journal-cbs-frontend'
+        GIT_REPO           = 'https://code.neyduetewa.gov.bt/govtech/fy25_26/journal_cbs/frontend.git'
+        BRANCH_NAME        = 'frontend-init'
+        HARBOR_REGISTRY    = 'hub.neyduetewa.gov.bt'
+        IMAGE_NAME         = "${HARBOR_REGISTRY}/rpis/${PROJECT_NAME}"
+        IMAGE_TAG          = "${env.BUILD_NUMBER}"
+        OWASP_REPORT_NAME  = "${PROJECT_NAME}-OWASP-Report-${env.BUILD_NUMBER}.html"
+        TRIVY_REPORT_NAME  = "${PROJECT_NAME}-Trivy-Report-${env.BUILD_NUMBER}.html"
+        K8S_REPO           = 'https://code.neyduetewa.gov.bt/govtech/fy24_25/bhusis/bhusis-kubernetes-files.git'
+        DEPLOYMENT_FILE    = 'staging/frontend/deployment.yaml'
+        NVD_API_KEY        = credentials('NVD_API_KEY')
+        PORT               = '3005'
+        TARGET_URL         = 'http://172.30.3.10:31111'
+        ZAP_IMAGE          = 'ghcr.io/zaproxy/zaproxy:stable'
+        REPORT_DIR         = "reports"
+        SCANNER_HOME       = tool 'sonar-scanner'
+        SCA_IMAGE          = 'ghcr.io/google/osv-scanner'
+        
+        // Backend API URL
+        VITE_APP_API_URL   = 'http://172.30.3.10:30886/api/v1'
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: "${env.BRANCH_NAME}"]],  
+                    userRemoteConfigs: [[
+                        url: "${GIT_REPO}",
+                        credentialsId: 'sandeep-gitlab-creds'
+                    ]]
+                ])
+            }
+        }
+
+        stage('Install and Build Frontend') {
+            steps {
+                script {
+                    sh """
+                        docker run --rm \
+                            -v \$(pwd):/app \
+                            -v yarn-cache:/usr/local/share/.cache/yarn \
+                            node:22-alpine \
+                            sh -c "cd /app && \
+                                  corepack enable && \
+                                  yarn install --frozen-lockfile --ignore-scripts --ignore-engines && \
+                                  yarn build"
+                    """
+                }
+            }
+        }
+
+        stage('Static Code Analysis') {
+            steps {
+                withSonarQubeEnv('sonarqube-server') {
+                    sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                            -Dsonar.projectKey=${PROJECT_NAME} \
+                            -Dsonar.projectName=${PROJECT_NAME} \
+                            -Dsonar.projectVersion=${env.BUILD_NUMBER} \
+                            -Dsonar.sources=src \
+                            -Dsonar.language=ts \
+                            -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info \
+                            -Dsonar.exclusions='**/node_modules/**, **/public/**, **/dist/**, **/*.test.ts, **/*.spec.ts, **/*.stories.tsx'
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonarqube-token'
+                }
+            }
+        }
+        
+        stage('Build Frontend with Yarn') {
+            steps {
+                script {
+                    sh """
+                        docker run --rm \
+                            -v \$(pwd):/app \
+                            -v yarn-cache:/usr/local/share/.cache/yarn \
+                            node:22-alpine \
+                            sh -c "cd /app && \
+                                  corepack enable && \
+                                  export NODE_OPTIONS=\"--max-old-space-size=4096\" && \
+                                  yarn build"
+                    """
+                }
+            }
+        }
+        
+        stage('Security Scans') {
+            steps {
+                script {
+                    sh 'mkdir -p ${REPORT_DIR}'
+                    
+                    // OWASP Dependency Check
+                    dependencyCheck(
+                        odcInstallation: 'Dependency-Check',
+                        additionalArguments: """
+                            --scan . \
+                            --format HTML \
+                            --format JSON \
+                            --out ${WORKSPACE}/${REPORT_DIR} \
+                            --enableExperimental \
+                            --nvdApiKey ${NVD_API_KEY} \
+                            --nvdApiDelay 2000 \
+                            --disableYarnAudit \
+                            --data /var/lib/jenkins/owasp-data \
+                            --exclude **/dist/** \
+                            --exclude **/node_modules/**
+                        """
+                    )
+                    
+                    // OSV Scanner for yarn.lock
+                    sh """
+                        docker run --rm -v \$(pwd):/app \
+                            ${SCA_IMAGE} \
+                            --lockfile=/app/yarn.lock \
+                            --format html > ${REPORT_DIR}/${PROJECT_NAME}-OSV-Report-${BUILD_NUMBER}.html || true
+                    """
+                    
+                    // Yarn audit (instead of npm audit)
+                    sh """
+                        docker run --rm -v \$(pwd):/app -v \$(pwd)/${REPORT_DIR}:/reports \
+                            node:22-alpine \
+                            sh -c "cd /app && \
+                                  corepack enable && \
+                                  yarn audit --json > /reports/yarn-audit.json || true"
+                    """
+                    
+                    // Rename OWASP reports
+                    sh """
+                        mv ${REPORT_DIR}/dependency-check-report.html ${REPORT_DIR}/${OWASP_REPORT_NAME} 2>/dev/null || true
+                        mv ${REPORT_DIR}/dependency-check-report.json ${REPORT_DIR}/${PROJECT_NAME}-OWASP-DC-Report-${BUILD_NUMBER}.json 2>/dev/null || true
+                    """
+                    
+                    archiveArtifacts artifacts: "${REPORT_DIR}/${OWASP_REPORT_NAME}"
+                    archiveArtifacts artifacts: "${REPORT_DIR}/${PROJECT_NAME}-OSV-Report-*.html"
+                    archiveArtifacts artifacts: "${REPORT_DIR}/yarn-audit.json"
+                }
+            }
+        }
+        
+        stage('Build and Push Docker Image') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-creds',
+                    passwordVariable: 'HARBOR_PASSWORD', 
+                    usernameVariable: 'HARBOR_USERNAME'
+                )]) {
+                    script {
+                        sh """
+                            docker login ${HARBOR_REGISTRY} -u ${HARBOR_USERNAME} -p ${HARBOR_PASSWORD}
+                            docker build \
+                                --build-arg VITE_APP_API_URL=${VITE_APP_API_URL} \
+                                -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                                -t ${IMAGE_NAME}:latest \
+                                -f Dockerfile .
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    sh """
+                        mkdir -p ${REPORT_DIR}
+                        trivy image \
+                            --db-repository public.ecr.aws/aquasecurity/trivy-db \
+                            --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db \
+                            --scanners vuln \
+                            --format template --template @/usr/local/share/trivy/templates/html.tpl \
+                            --output ${REPORT_DIR}/${TRIVY_REPORT_NAME} \
+                            --severity HIGH,CRITICAL \
+                            --timeout 10m \
+                            ${IMAGE_NAME}:${IMAGE_TAG} || true
+                    """
+                    archiveArtifacts artifacts: "${REPORT_DIR}/${TRIVY_REPORT_NAME}", onlyIfSuccessful: false
+                }
+            }
+        }
+
+        stage('DAST Scan') {
+            steps {
+                script {
+                    sh """
+                        mkdir -p ${REPORT_DIR}
+                        chmod 777 ${REPORT_DIR}
+                    """
+
+                    def scanOutput = sh(script: """
+                        docker run --rm \
+                            --user 0:0 \
+                            --network host \
+                            -v \$(pwd)/${REPORT_DIR}:/zap/wrk/:rw \
+                            ${ZAP_IMAGE} \
+                            zap-full-scan.py \
+                            -t ${TARGET_URL} \
+                            -r zap-report.html \
+                            -x zap-report.xml \
+                            -J zap-report.json \
+                            -m 5 \
+                            -z "-config connection.timeoutInSecs=30 -config api.disablekey=true" || true
+                    """, returnStdout: true)
+
+                    writeFile file: "${REPORT_DIR}/zap-scan-output.txt", text: scanOutput
+                    archiveArtifacts artifacts: "${REPORT_DIR}/zap-report.*,${REPORT_DIR}/zap-scan-output.txt", fingerprint: true
+
+                    if (fileExists("${REPORT_DIR}/zap-report.html")) {
+                        echo "HTML report generated successfully"
+                        if (scanOutput.contains('FAIL-NEW: 0')) {
+                            echo 'No new security issues found'
+                        } else {
+                            unstable('Security vulnerabilities detected')
+                        }
+                    } else {
+                        error("HTML report generation failed")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/*', fingerprint: true
+            echo "All reports archived successfully."
+            sh 'docker logout'
+            cleanWs()
+        }
+        success {
+            echo "=========================================="
+            echo "Frontend Pipeline Completed Successfully!"
+            echo "=========================================="
+            echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "Frontend URL: ${TARGET_URL}:${PORT}"
+            echo "API URL: ${VITE_APP_API_URL}"
+            echo "=========================================="
+        }
+        failure {
+            echo "=========================================="
+            echo "Frontend Pipeline Failed!"
+            echo "=========================================="
+            sh 'docker-compose -f compose.yaml logs --tail=50 || true'
+        }
+    }
+}
